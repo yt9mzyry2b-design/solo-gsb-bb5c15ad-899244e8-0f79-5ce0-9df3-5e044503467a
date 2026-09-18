@@ -172,5 +172,16 @@ class ReservationOut(BaseModel):
     start_utc: str = Field(description="UTC 开始时间 ISO 8601", examples=["2026-03-09T13:00:00Z"])
     end_utc: str
     participants: list[str] = Field(description="参与者 id，去重后按字典序排列")
-    version: int = Field(description="乐观锁版本：创建为 1，每次成功改期加 1", examples=[1])
+    version: int = Field(
+        description="乐观锁版本：创建为 1，每次成功改期或取消加 1", examples=[1])
+    status: Literal["active", "canceled"] = Field(
+        default="active",
+        description="预约状态：active=有效；canceled=已取消（软删除，占用已释放）",
+        examples=["active"],
+    )
+    canceled_at: str | None = Field(
+        default=None,
+        description="取消时刻（UTC ISO 8601）；未取消时为 null",
+        examples=["2026-03-09T14:05:00.123456Z"],
+    )
     created_at: str

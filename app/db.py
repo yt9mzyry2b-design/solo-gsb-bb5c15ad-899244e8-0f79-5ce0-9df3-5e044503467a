@@ -20,7 +20,9 @@ CREATE TABLE IF NOT EXISTS reservations (
     start_utc        TEXT NOT NULL,
     end_utc          TEXT NOT NULL,
     participants_key TEXT NOT NULL,  -- 规范化参与者列表（去重排序后的 JSON），用于幂等比较
-    version          INTEGER NOT NULL DEFAULT 1,  -- 乐观锁版本：创建为 1，每次改期 +1
+    version          INTEGER NOT NULL DEFAULT 1,  -- 乐观锁版本：创建为 1，每次改期/取消 +1
+    status           TEXT NOT NULL DEFAULT 'active',  -- 'active' | 'canceled'（软删除）
+    canceled_at      TEXT,  -- 取消时刻（UTC 定宽文本）；未取消为 NULL
     created_at       TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS reservation_participants (
@@ -61,9 +63,14 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
 def init_db(db_path: str | None = None) -> None:
     """建表（幂等）。应用启动时调用一次即可。
 
-    对升级前已存在的 SQLite 数据库执行**无损在线迁移**：
-    若 ``reservations`` 表缺少 ``version`` 列，则以 ``DEFAULT 1`` 补齐，
-    既有行自动得到 ``version=1``，其余数据（含参与者占用）保持不变。
+    对升级前已存在的 SQLite 数据库执行**无损在线迁移**（各步彼此独立、可重入）：
+
+    - 若 ``reservations`` 表缺少 ``version`` 列，则以 ``DEFAULT 1`` 补齐，
+      既有行自动得到 ``version=1``；
+    - 若缺少 ``status`` 列，则以 ``DEFAULT 'active'`` 补齐，既有预约视为未取消；
+    - 若缺少 ``canceled_at`` 列，则补为可空列，既有行得到 ``NULL``。
+
+    其余数据（含参与者占用）始终保持不变。
     """
     path = db_path or get_db_path()
     with _init_lock:
@@ -78,6 +85,15 @@ def init_db(db_path: str | None = None) -> None:
                 conn.execute(
                     "ALTER TABLE reservations"
                     " ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
+            if "status" not in columns:
+                # 既有预约全部视为仍然有效（active），取消列同时补齐为 NULL
+                conn.execute(
+                    "ALTER TABLE reservations"
+                    " ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+            if "canceled_at" not in columns:
+                # 可空列：既有行回填 NULL；ADD COLUMN 允许直接带 NULL 默认值
+                conn.execute(
+                    "ALTER TABLE reservations ADD COLUMN canceled_at TEXT")
         finally:
             conn.close()
         _initialized.add(path)
