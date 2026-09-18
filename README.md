@@ -1,7 +1,8 @@
 # 跨时区可用时段聚合 API
 
 基于 **Python + FastAPI + 标准库 `zoneinfo`** 的会议候选时段聚合服务，
-并附带 **SQLite 持久化的会议预约接口**（幂等创建、乐观锁版本改期、单事务冲突检测）。
+并附带 **SQLite 持久化的会议预约接口**（幂等创建、乐观锁版本改期、
+软删除取消、单事务冲突检测）。
 
 每位参与者按**本地星期与钟面时刻**填写每周重复的可用区间并给出 IANA 时区
 （如 `Asia/Shanghai`），服务按具体日期应用夏令时（DST）规则，统一换算到 UTC，
@@ -28,7 +29,7 @@
 ```
 app/
   scheduling.py    # 聚合核心：本地时刻换算、跨午夜拆分、扫描线、排序
-  reservations.py  # 预约核心：规范化、幂等创建、乐观锁版本改期、单事务冲突检测
+  reservations.py  # 预约核心：规范化、幂等创建、乐观锁版本改期/取消、单事务冲突检测
   db.py            # SQLite 连接管理与建表（路径可配置）
   schemas.py       # Pydantic 请求/响应模型
   main.py          # FastAPI 路由
@@ -58,8 +59,9 @@ docker compose up --build
 
 启动时应用会**自动初始化 SQLite 数据库**（建表幂等）；数据库文件落在命名卷
 `reservations-data`（容器内 `/data`）上，容器重建后预约数据不丢失。
-升级到带 `version` 的版本后首次启动时，会为**既有数据无损补齐** `version=1`
-（`ALTER TABLE ADD COLUMN ... DEFAULT 1`），无需手工迁移。
+升级到带 `version` / 取消能力的版本后首次启动时，会为**既有数据无损补齐**
+`version=1`、`status='active'`、`canceled_at=NULL`
+（`ALTER TABLE ADD COLUMN ... DEFAULT ...`），无需手工迁移。
 
 服务启动后访问 <http://localhost:8000>（Swagger UI 在 <http://localhost:8000/docs>）。
 若 8000 端口被占用：
@@ -186,7 +188,9 @@ curl -s -X POST http://localhost:8000/api/v1/availability/aggregate \
   只要任一参与者与已有预约存在**半开区间重叠**（`existing.start < new.end` 且
   `new.start < existing.end`），整个请求被拒绝，不会留下部分写入。
   **相邻区间不冲突**（`end == start` 首尾相接可以共存）。
-- **版本号**：每条预约带单调递增的 `version`，创建时为 `1`，每次成功改期加 `1`。
+- **版本号**：每条预约带单调递增的 `version`，创建时为 `1`，每次成功改期或取消加 `1`。
+- **状态**：`status` 为 `active`（进行中）或 `canceled`（已取消，软删除终态）；
+  未取消时 `canceled_at` 为 `null`。
 - **幂等**：相同 `request_id` + 相同规范化内容（起止时刻、去重排序后的参与者）
   重试 → `200` 返回原预约，不新增记录；同一 `request_id` 内容不同 → `409`。
 
@@ -213,6 +217,8 @@ curl -s -X POST http://localhost:8000/api/v1/reservations \
   "end_utc": "2026-03-09T14:00:00Z",
   "participants": ["alice", "bob"],
   "version": 1,
+  "status": "active",
+  "canceled_at": null,
   "created_at": "2026-09-17T20:42:39.634009Z"
 }
 ```
@@ -249,9 +255,10 @@ curl -s -X POST http://localhost:8000/api/v1/reservations \
 
 语义：
 
-- 整个流程（存在性 → 版本匹配 → 冲突检查 → 替换）在单个 `BEGIN IMMEDIATE`
+- 整个流程（存在性 → 状态 → 版本匹配 → 冲突检查 → 替换）在单个 `BEGIN IMMEDIATE`
   事务内完成；**任一步失败都整体回滚**，预约与参与者占用保持原状。
 - 预约不存在 → `404`。
+- 预约已取消 → `409`：取消是终态，改期**不会**使其复活。
 - `expected_version` 与当前版本不一致（已被别人改过）→ `409`，响应给出
   `current_version`；客户端可用它重新读取后重试。
 - 冲突检查沿用半开区间规则，并**排除自身**（`reservation_id != 当前预约`）：
@@ -283,6 +290,8 @@ curl -s -X PUT http://localhost:8000/api/v1/reservations/1 \
   "end_utc": "2026-03-09T16:00:00Z",
   "participants": ["alice", "carol"],
   "version": 2,
+  "status": "active",
+  "canceled_at": null,
   "created_at": "2026-09-17T20:42:39.634009Z"
 }
 ```
@@ -305,6 +314,62 @@ curl -s -X PUT http://localhost:8000/api/v1/reservations/1 \
 参与者冲突时返回的 `409` 结构与创建接口一致（`detail` + `conflicts` 明细）。
 其他错误：`422`（`expected_version < 1`、时间/参与者非法等）。
 
+### `DELETE /api/v1/reservations/{reservation_id}`
+
+取消预约（**软删除**，乐观并发控制）。查询参数：
+
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `expected_version` | 正整数，**必填** | 客户端上次读到的版本号；与当前版本一致才执行取消 |
+
+语义：
+
+- 整个流程（存在性 → 状态 → 版本匹配 → 取消 → 释放占用）在单个
+  `BEGIN IMMEDIATE` 事务内完成；任一步失败都整体回滚。
+- 预约不存在 → `404`。
+- `expected_version` 与当前版本不一致 → `409`，响应给出 `current_version`。
+- 成功 → `200`：`status` 置为 `canceled`、记录 `canceled_at`、`version` 加 `1`，
+  并**同事务删除全部参与者占用**——时段提交后立即可被再次预约；
+  预约行本身保留（软删除），`request_id`、`created_at` 等不变。
+- **幂等重试**：相同 `reservation_id` + 原 `expected_version` 重试 → `200`
+  返回**同一取消结果**（同样的 `canceled_at` 与版本），不重复变更；
+  取消后使用其他版本号 → `409` + `current_version`。
+- 取消是**终态**：之后 `PUT` 改期一律 `409`，预约不会复活；
+  创建请求的迟到重试（同 `request_id` + 同内容）幂等返回该已取消记录。
+
+请求示例：
+
+```bash
+curl -s -X DELETE 'http://localhost:8000/api/v1/reservations/1?expected_version=2'
+```
+
+成功/幂等重放响应（`200`）：
+
+```json
+{
+  "reservation_id": 1,
+  "request_id": "req-9f3a",
+  "start_utc": "2026-03-09T15:00:00Z",
+  "end_utc": "2026-03-09T16:00:00Z",
+  "participants": ["alice", "carol"],
+  "version": 3,
+  "status": "canceled",
+  "canceled_at": "2026-09-17T21:05:12.345678Z",
+  "created_at": "2026-09-17T20:42:39.634009Z"
+}
+```
+
+版本不匹配（`409`）：
+
+```json
+{
+  "detail": "expected_version does not match current version of reservation #1",
+  "current_version": 3
+}
+```
+
+其他错误：`404`（预约不存在）、`422`（缺少 `expected_version` 或其值 `< 1`）。
+
 ## 测试覆盖要点
 
 - **春季跳变**：不存在的钟面时刻报错；跨越跳变间隙的窗口 UTC 时长缩短（柏林 2026-03-29 00:00–04:00 实际只有 3 小时）。
@@ -316,7 +381,12 @@ curl -s -X PUT http://localhost:8000/api/v1/reservations/1 \
   多线程并发下同一时段仅一个赢家、并发重放只建一条记录；
   **改期**：不存在 404、版本过期 409 并回传 `current_version`、排除自身的
   半开区间冲突 409、失败不改预约/占用、成功原子替换且版本递增、
-  并发改期仅一个赢家；以及**旧版数据库启动时无损补齐 `version=1`** 的迁移。
+  并发改期仅一个赢家；
+  **取消**：软删除置 `canceled` 并记录 `canceled_at`、版本递增、
+  占用同事务释放使时段立即可再约、原 `expected_version` 重试幂等返回
+  同一结果、其他版本 409、取消后改期 409 不复活、并发取消仅一次实际变更；
+  以及**旧版数据库启动时无损补齐 `version=1`、`status='active'`、
+  `canceled_at=NULL`** 的迁移。
 
 ```bash
 pytest -q

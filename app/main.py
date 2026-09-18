@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Query, Response
 from fastapi.responses import JSONResponse
 
 from . import db as db_module
@@ -17,6 +17,7 @@ from . import reservations as reservation_core
 from . import scheduling
 from .reservations import (
     RequestIdConflictError,
+    ReservationCanceledError,
     ReservationConflictError,
     ReservationNotFoundError,
     VersionConflictError,
@@ -51,9 +52,9 @@ app = FastAPI(
         "重复可用区间与 IANA 时区，返回可安排会议的 UTC 候选时段及各自本地时刻。"
         "DST 按具体日期应用：不存在的本地时刻返回 400，歧义时刻统一取 fold=0。"
         "另提供 SQLite 持久化的会议预约接口：单事务冲突检测 + request_id 幂等，"
-        "并支持带乐观版本号的改期（PUT）。"
+        "支持带乐观版本号的改期（PUT）与软删除取消（DELETE，取消后时段立即释放）。"
     ),
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -92,6 +93,17 @@ async def reservation_not_found_handler(request, exc: ReservationNotFoundError) 
 
 @app.exception_handler(VersionConflictError)
 async def version_conflict_handler(request, exc: VersionConflictError) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": str(exc),
+            "current_version": exc.current_version,
+        },
+    )
+
+
+@app.exception_handler(ReservationCanceledError)
+async def reservation_canceled_handler(request, exc: ReservationCanceledError) -> JSONResponse:
     return JSONResponse(
         status_code=409,
         content={
@@ -187,6 +199,8 @@ def _reservation_to_out(r: reservation_core.Reservation) -> ReservationOut:
         end_utc=_iso_z(r.end_utc),
         participants=list(r.participants),
         version=r.version,
+        status=r.status,
+        canceled_at=_iso_z(r.canceled_at) if r.canceled_at is not None else None,
         created_at=_iso_z(r.created_at),
     )
 
@@ -218,6 +232,7 @@ def reschedule_reservation(
     """改期（乐观并发控制）。
 
     - 预约不存在 → 404；
+    - 预约已取消 → 409（取消是终态，改期不会使其复活）；
     - ``expected_version`` 与当前版本不一致 → 409，响应给出 ``current_version``；
     - 任一新参与者与**其他**预约半开区间重叠（自动排除自身）→ 409 + 冲突明细；
     - 成功 → 原子替换时间与参与者占用，``version`` 加 1，返回更新后的预约。
@@ -231,5 +246,31 @@ def reschedule_reservation(
         start_utc=req.start_utc,
         end_utc=req.end_utc,
         participant_ids=req.participant_ids,
+    )
+    return _reservation_to_out(reservation)
+
+
+@app.delete("/api/v1/reservations/{reservation_id}", response_model=ReservationOut)
+def cancel_reservation(
+    reservation_id: int,
+    expected_version: int = Query(
+        ge=1,
+        description="客户端上次读到的预约版本；与当前版本一致才执行取消",
+    ),
+) -> ReservationOut:
+    """取消预约（软删除，乐观并发控制）。
+
+    - 预约不存在 → 404；
+    - ``expected_version`` 与当前版本不一致 → 409，响应给出 ``current_version``；
+    - 成功 → 单个 ``BEGIN IMMEDIATE`` 事务内把预约置为 ``canceled``、记录
+      ``canceled_at``、``version`` 加 1，并删除全部参与者占用，
+      时段提交后立即可再次预约；
+    - 相同 ``reservation_id`` + 原 ``expected_version`` 的重试 → 幂等返回
+      同一取消结果（同样的 ``canceled_at`` 与版本），不重复变更；
+    - 取消是终态：之后 PUT 改期一律 409，不会复活。
+    """
+    reservation, _ = reservation_core.cancel_reservation(
+        reservation_id=reservation_id,
+        expected_version=expected_version,
     )
     return _reservation_to_out(reservation)

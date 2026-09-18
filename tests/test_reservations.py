@@ -584,6 +584,204 @@ def test_concurrent_reschedules_via_api(db_path):
     assert body.json()["version"] == 3
 
 
+# ---------------------------------------------------------------------- 取消
+
+def _delete(client, reservation_id, expected_version=1):
+    return client.delete(
+        f"/api/v1/reservations/{reservation_id}",
+        params={"expected_version": expected_version},
+    )
+
+
+def test_create_response_includes_active_status(client):
+    resp = client.post("/api/v1/reservations", json=_payload())
+    assert resp.status_code == 201
+    data = resp.json()
+    assert data["status"] == "active"
+    assert data["canceled_at"] is None
+
+
+def test_cancel_success_soft_deletes_and_frees_slot(client):
+    created = client.post("/api/v1/reservations", json=_payload()).json()
+    rid = created["reservation_id"]
+
+    resp = _delete(client, rid, expected_version=1)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["reservation_id"] == rid
+    assert data["status"] == "canceled"
+    assert data["canceled_at"]                       # 记录了取消时刻
+    assert data["version"] == 2                      # 版本 +1
+    # 时间、参与者、request_id、created_at 保持不变
+    assert data["request_id"] == created["request_id"]
+    assert data["start_utc"] == created["start_utc"]
+    assert data["end_utc"] == created["end_utc"]
+    assert data["participants"] == created["participants"]
+    assert data["created_at"] == created["created_at"]
+
+    # 时段立即可再次预约：同一批参与者、同一窗口不再冲突
+    resp = client.post("/api/v1/reservations", json=_payload(
+        request_id="req-rebook",
+        start_utc="2026-03-09T13:00:00Z",
+        end_utc="2026-03-09T14:00:00Z",
+        participant_ids=["alice", "bob"],
+    ))
+    assert resp.status_code == 201, resp.text
+
+
+def test_cancel_unknown_id_returns_404(client):
+    resp = _delete(client, 999)
+    assert resp.status_code == 404
+    assert "999" in resp.json()["detail"]
+
+
+def test_cancel_stale_version_returns_409_and_keeps_reservation(client):
+    created = client.post("/api/v1/reservations", json=_payload()).json()
+    rid = created["reservation_id"]
+
+    resp = _delete(client, rid, expected_version=5)
+    assert resp.status_code == 409
+    assert resp.json()["current_version"] == 1
+
+    # 预约未被取消：版本/状态不变，占用仍在（同时段仍冲突）
+    replay = client.post("/api/v1/reservations", json=_payload()).json()
+    assert replay["status"] == "active"
+    assert replay["version"] == 1
+    assert replay["canceled_at"] is None
+    resp = client.post("/api/v1/reservations", json=_payload(
+        request_id="req-check",
+        start_utc="2026-03-09T13:30:00Z",
+        end_utc="2026-03-09T13:45:00Z",
+        participant_ids=["alice"],
+    ))
+    assert resp.status_code == 409
+
+
+def test_cancel_idempotent_retry_returns_same_result(client):
+    rid = client.post("/api/v1/reservations", json=_payload()).json()["reservation_id"]
+    first = _delete(client, rid, expected_version=1)
+    assert first.status_code == 200
+
+    # 相同 reservation_id + 原 expected_version 重试 → 同一取消结果
+    retry = _delete(client, rid, expected_version=1)
+    assert retry.status_code == 200
+    assert retry.json() == first.json()
+    assert retry.json()["canceled_at"] == first.json()["canceled_at"]
+
+
+def test_cancel_with_other_versions_after_cancel_returns_409(client):
+    rid = client.post("/api/v1/reservations", json=_payload()).json()["reservation_id"]
+    assert _delete(client, rid, expected_version=1).status_code == 200  # → version 2
+
+    # 取消后的当前版本（2）不是“原 expected_version” → 409
+    resp = _delete(client, rid, expected_version=2)
+    assert resp.status_code == 409
+    assert resp.json()["current_version"] == 2
+    # 更旧的/不存在的版本同样 409
+    resp = _delete(client, rid, expected_version=7)
+    assert resp.status_code == 409
+    assert resp.json()["current_version"] == 2
+
+
+def test_cancel_after_reschedule_uses_current_version(client):
+    rid = client.post("/api/v1/reservations", json=_payload()).json()["reservation_id"]
+    assert _put(client, rid).status_code == 200  # 改期 → version 2
+    # 旧版本取消 → 409
+    resp = _delete(client, rid, expected_version=1)
+    assert resp.status_code == 409
+    assert resp.json()["current_version"] == 2
+    # 当前版本取消成功，重试幂等
+    first = _delete(client, rid, expected_version=2)
+    assert first.status_code == 200
+    assert first.json()["version"] == 3
+    retry = _delete(client, rid, expected_version=2)
+    assert retry.status_code == 200
+    assert retry.json() == first.json()
+
+
+def test_reschedule_after_cancel_returns_409_and_does_not_resurrect(client):
+    rid = client.post("/api/v1/reservations", json=_payload(
+        participant_ids=["alice"])).json()["reservation_id"]
+    canceled = _delete(client, rid, expected_version=1).json()
+    assert canceled["version"] == 2
+
+    # 用取消后的当前版本改期 → 409；用旧版本改期 → 同样 409
+    resp = _put(client, rid, expected_version=2)
+    assert resp.status_code == 409
+    assert "canceled" in resp.json()["detail"]
+    assert _put(client, rid, expected_version=1).status_code == 409
+
+    # 未复活：取消结果保持原样（同一 canceled_at、版本不再变化）
+    replay = _delete(client, rid, expected_version=1)
+    assert replay.status_code == 200
+    assert replay.json() == canceled
+    # 时段仍然空闲：他人可立即预约原窗口
+    resp = client.post("/api/v1/reservations", json=_payload(
+        request_id="req-after-cancel",
+        start_utc="2026-03-09T13:00:00Z",
+        end_utc="2026-03-09T14:00:00Z",
+        participant_ids=["alice"],
+    ))
+    assert resp.status_code == 201, resp.text
+
+
+def test_create_replay_after_cancel_returns_canceled_record(client):
+    """创建请求的迟到重试（同 request_id + 同内容）幂等返回已取消的原预约。"""
+    first = client.post("/api/v1/reservations", json=_payload())
+    assert first.status_code == 201
+    rid = first.json()["reservation_id"]
+    assert _delete(client, rid, expected_version=1).status_code == 200
+
+    replay = client.post("/api/v1/reservations", json=_payload())
+    assert replay.status_code == 200
+    assert replay.json()["reservation_id"] == rid
+    assert replay.json()["status"] == "canceled"  # 重放不会复活预约
+
+
+def test_cancel_requires_valid_expected_version(client):
+    rid = client.post("/api/v1/reservations", json=_payload()).json()["reservation_id"]
+    # 缺少查询参数
+    assert client.delete(f"/api/v1/reservations/{rid}").status_code == 422
+    # expected_version < 1
+    assert _delete(client, rid, expected_version=0).status_code == 422
+
+
+def test_concurrent_cancels_are_idempotent_single_mutation(db_path):
+    """8 个并发取消（同一 expected_version）：全部成功，恰一个实际执行取消。
+
+    其余请求在 BEGIN IMMEDIATE 串行化后读到已取消状态，且
+    expected_version == current_version - 1，按幂等重试返回同一结果。
+    """
+    reservation, _ = core.create_reservation(
+        request_id="req-base",
+        start_utc=_utc(2026, 3, 9, 13),
+        end_utc=_utc(2026, 3, 9, 14),
+        participant_ids=["alice"],
+        db_path=db_path,
+    )
+    barrier = threading.Barrier(8)
+
+    def worker():
+        barrier.wait()
+        return core.cancel_reservation(
+            reservation_id=reservation.id,
+            expected_version=1,
+            db_path=db_path,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        outcomes = list(pool.map(lambda _: worker(), range(8)))
+
+    # 恰好一个请求真正执行了取消，其余都是幂等重放
+    assert sum(1 for _, canceled in outcomes if canceled) == 1
+    # 所有请求拿到完全一致的取消结果（版本、canceled_at 相同）
+    states = {(r.version, r.status, r.canceled_at) for r, _ in outcomes}
+    assert len(states) == 1
+    version, status, canceled_at = states.pop()
+    assert (version, status) == (2, "canceled")
+    assert canceled_at is not None
+
+
 # -------------------------------------------------- 既有数据库无损迁移 version
 
 _LEGACY_SCHEMA = """\
@@ -653,6 +851,9 @@ def test_startup_backfills_version_1_for_legacy_data(tmp_path, monkeypatch):
     assert got.id == 1
     assert got.version == 1
     assert got.participants == ("alice", "bob")
+    # 取消相关列同样无损补齐：进行中、无取消时刻
+    assert got.status == "active"
+    assert got.canceled_at is None
 
     # 基于补齐的 version=1 可以改期成功
     moved = core.reschedule_reservation(
@@ -670,6 +871,88 @@ def test_startup_backfills_version_1_for_legacy_data(tmp_path, monkeypatch):
         request_id="new-req",
         start_utc=_utc(2026, 3, 9, 13, 30),
         end_utc=_utc(2026, 3, 9, 13, 45),
+        participant_ids=["alice"],
+        db_path=path,
+    )
+    assert created is True
+
+
+# -------------------------------------- 既有数据库无损迁移 status / canceled_at
+
+# 上一版本应用的表结构：有 version，但无 status / canceled_at
+_PRE_CANCEL_SCHEMA = """\
+CREATE TABLE reservations (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id       TEXT NOT NULL UNIQUE,
+    start_utc        TEXT NOT NULL,
+    end_utc          TEXT NOT NULL,
+    participants_key TEXT NOT NULL,
+    version          INTEGER NOT NULL DEFAULT 1,
+    created_at       TEXT NOT NULL
+);
+CREATE TABLE reservation_participants (
+    reservation_id INTEGER NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
+    participant_id TEXT NOT NULL,
+    start_utc      TEXT NOT NULL,
+    end_utc        TEXT NOT NULL,
+    PRIMARY KEY (reservation_id, participant_id)
+);
+CREATE INDEX idx_rp_participant_window
+    ON reservation_participants (participant_id, start_utc, end_utc);
+"""
+
+
+def test_startup_backfills_cancel_columns_for_pre_cancel_data(tmp_path, monkeypatch):
+    import sqlite3
+
+    path = str(tmp_path / "pre-cancel.db")
+    # 模拟上一版本应用写入的既有数据（有 version、无 status/canceled_at）
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(_PRE_CANCEL_SCHEMA)
+        conn.execute(
+            "INSERT INTO reservations"
+            " (request_id, start_utc, end_utc, participants_key, version, created_at)"
+            " VALUES ('old-req', '2026-03-09T13:00:00.000000Z',"
+            " '2026-03-09T14:00:00.000000Z', '[\"alice\"]', 2,"
+            " '2026-03-01T00:00:00.000000Z')")
+        conn.execute(
+            "INSERT INTO reservation_participants"
+            " (reservation_id, participant_id, start_utc, end_utc)"
+            " VALUES (1, 'alice', '2026-03-09T13:00:00.000000Z',"
+            " '2026-03-09T14:00:00.000000Z')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("RESERVATIONS_DB_PATH", path)
+    db_module.init_db(path)
+    db_module.init_db(path)  # 迁移幂等
+
+    # 既有行无损：版本保留，状态补为 active、canceled_at 为 NULL
+    got = core.create_reservation(
+        request_id="old-req",
+        start_utc=_utc(2026, 3, 9, 13),
+        end_utc=_utc(2026, 3, 9, 14),
+        participant_ids=["alice"],
+        db_path=path,
+    )[0]
+    assert got.version == 2
+    assert got.status == "active"
+    assert got.canceled_at is None
+
+    # 迁移后的库上取消可用：版本 2 → 3，占用释放，时段立即可再约
+    canceled, did_cancel = core.cancel_reservation(
+        reservation_id=1, expected_version=2, db_path=path)
+    assert did_cancel is True
+    assert canceled.version == 3
+    assert canceled.status == "canceled"
+    assert canceled.canceled_at is not None
+
+    rebooked, created = core.create_reservation(
+        request_id="rebook-req",
+        start_utc=_utc(2026, 3, 9, 13),
+        end_utc=_utc(2026, 3, 9, 14),
         participant_ids=["alice"],
         db_path=path,
     )

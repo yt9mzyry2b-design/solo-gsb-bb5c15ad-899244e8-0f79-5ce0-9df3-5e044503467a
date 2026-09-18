@@ -20,7 +20,9 @@ CREATE TABLE IF NOT EXISTS reservations (
     start_utc        TEXT NOT NULL,
     end_utc          TEXT NOT NULL,
     participants_key TEXT NOT NULL,  -- 规范化参与者列表（去重排序后的 JSON），用于幂等比较
-    version          INTEGER NOT NULL DEFAULT 1,  -- 乐观锁版本：创建为 1，每次改期 +1
+    version          INTEGER NOT NULL DEFAULT 1,  -- 乐观锁版本：创建为 1，每次改期/取消 +1
+    status           TEXT NOT NULL DEFAULT 'active',  -- active=进行中；canceled=已取消（软删除）
+    canceled_at      TEXT,  -- 取消时刻（UTC 定宽文本）；未取消为 NULL
     created_at       TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS reservation_participants (
@@ -62,8 +64,10 @@ def init_db(db_path: str | None = None) -> None:
     """建表（幂等）。应用启动时调用一次即可。
 
     对升级前已存在的 SQLite 数据库执行**无损在线迁移**：
-    若 ``reservations`` 表缺少 ``version`` 列，则以 ``DEFAULT 1`` 补齐，
-    既有行自动得到 ``version=1``，其余数据（含参与者占用）保持不变。
+    若 ``reservations`` 表缺少 ``version`` / ``status`` / ``canceled_at`` 列，
+    则逐列以 ``ALTER TABLE ADD COLUMN`` 补齐——既有行自动得到
+    ``version=1``、``status='active'``、``canceled_at=NULL``，
+    其余数据（含参与者占用）保持不变。
     """
     path = db_path or get_db_path()
     with _init_lock:
@@ -72,12 +76,20 @@ def init_db(db_path: str | None = None) -> None:
             conn.executescript(_SCHEMA)
             columns = {row["name"] for row in conn.execute(
                 "PRAGMA table_info(reservations)")}
+            # ALTER TABLE ADD COLUMN 带 NOT NULL DEFAULT：
+            # 既有行立即获得默认值，不重写/删除任何数据
             if "version" not in columns:
-                # ALTER TABLE ADD COLUMN 带 NOT NULL DEFAULT：
-                # 既有行立即获得默认值 1，不重写/删除任何数据
                 conn.execute(
                     "ALTER TABLE reservations"
                     " ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
+            if "status" not in columns:
+                conn.execute(
+                    "ALTER TABLE reservations"
+                    " ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+            if "canceled_at" not in columns:
+                # 可空列：既有行自动为 NULL（未取消）
+                conn.execute(
+                    "ALTER TABLE reservations ADD COLUMN canceled_at TEXT")
         finally:
             conn.close()
         _initialized.add(path)
